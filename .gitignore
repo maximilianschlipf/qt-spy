@@ -1,0 +1,183 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+Testing/
+DartConfiguration.tcl
+install_manifest.txt
+
+# Qt generated files
+*_autogen/
+mocs_compilation.cpp
+qrc_*.cpp
+ui_*.h
+*.qm
+
+# Compiled binaries and libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Object files
+*.o
+*.obj
+*.slo
+*.lo
+
+# Qt Creator
+CMakeLists.txt.user*
+*.pro.user*
+*.qbs.user*
+*.creator
+*.creator.user*
+*.includes
+*.files
+*.config
+
+# Visual Studio / Visual Studio Code
+.vs/
+.vscode/
+*.vcxproj*
+*.sln
+*.suo
+*.user
+*.ncb
+*.aps
+*.pch
+*.vspscc
+*_i.c
+*_p.c
+*.tlb
+*.tlh
+*.bak
+*.cache
+*.res
+*.rc
+*.tmp
+*.log
+
+# CLion
+.idea/
+cmake-build-*/
+
+# Xcode
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+*.moved-aside
+*.xccheckout
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Temporary files
+*.swp
+*.swo
+*~
+.*.tmp
+*.tmp
+
+# Core dumps
+core
+core.*
+
+# Package managers
+conan.lock
+conandata.yml
+conanfile.txt.orig
+
+# Generated documentation
+doc/html/
+doc/latex/
+*.dox
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Profiling
+*.gprof
+gmon.out
+
+# Coverage
+*.gcno
+*.gcda
+*.gcov
+lcov.info
+coverage/
+
+# Sanitizer output
+*.san
+
+# Local environment files
+.env
+.env.local
+.env.*.local
+
+# IDE and editor backup files
+*#
+.#*
+*.orig
+*.rej
+*.bak
+*.backup
+
+# Distribution / packaging
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test results
+test_results/
+*.xml
