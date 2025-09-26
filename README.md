@@ -1,6 +1,26 @@
 # qt-spy
 
-qt-spy is an inspector prototype that attaches to a running Qt 5/6 MMI, enumerates the QObject/QWidget hierarchy, and returns a JSON snapshot of properties. Phase 1 extends the spike with a reusable bridge client, incremental update plumbing, and a CLI that can reconnect or inject the probe into plain Qt processes on demand.
+qt-spy is an inspect1. Launch the sample MMI in one terminal:
+
+   ```bash
+   ./build/sample_mmi/sample_mmi &
+   ```
+
+   The window titled "Sample MMI" appears. The probe starts automatically and logs the server name to stdout (e.g. `qt_spy_sample_mmi_12345`).
+
+1. Discover the PID (if needed) to derive the server name:
+
+   ```bash
+   pidof sample_mmi
+   ```
+
+1. From another terminal, run the CLI with either the PID or the explicit server name:
+
+   ```bash
+   ./build/cli/qt_spy_cli --pid <PID>
+   # or
+   ./build/cli/qt_spy_cli --server qt_spy_sample_mmi_<PID>
+   ``` attaches to a running Qt 5/6 MMI, enumerates the QObject/QWidget hierarchy, and returns a JSON snapshot of properties. Phase 1 extends the spike with a reusable bridge client, incremental update plumbing, and a CLI that can reconnect or inject the probe into plain Qt processes on demand.
 
 ## Building
 
@@ -9,14 +29,24 @@ cmake -S . -B build
 cmake --build build
 ```
 
-The build produces two executables in `build/`:
+The build produces three executables in `build/`:
 
 - `sample_mmi`: a demo Qt Widgets application that automatically embeds the qt-spy probe.
+- `sample_plain_mmi`: a plain Qt Widgets application without embedded probe (for testing injection).
 - `qt_spy_cli`: a console client that connects to the probe and prints a hierarchy dump.
 
 In addition, `libqt_spy_bridge.a` exposes the reusable bridge client in `bridge/include/qt_spy/bridge_client.h` for the upcoming inspector UI.
 
-## Running the Phase 0 Spike
+## Quick Start
+
+### Testing with Sample Applications
+
+qt-spy includes two sample applications for testing:
+
+- **`sample_mmi`**: Has the qt-spy probe embedded automatically (for basic testing)
+- **`sample_plain_mmi`**: Plain Qt application without probe (for testing injection)
+
+### Running with Embedded Probe
 
 1. Launch the sample MMI in one terminal:
    ```bash
@@ -41,6 +71,19 @@ In addition, `libqt_spy_bridge.a` exposes the reusable bridge client in `bridge/
    - Application metadata (`applicationName`, `applicationPid`, `serverName`).
    - All top-level widgets/windows.
    - Each QObject/QWidget child with properties, geometry info, and dynamic properties if present.
+
+### Testing Injection with Plain Sample
+
+To test the injection functionality, use the plain sample application:
+
+```bash
+# Terminal 1: Start plain Qt app (no embedded probe)
+./build/sample_plain_mmi/sample_plain_mmi &
+
+# Terminal 2: Inject and connect using interactive mode
+./scripts/inject_qt_spy.sh    # Select sample_plain_mmi from menu
+./scripts/connect_qt_spy.sh   # Select same process for monitoring
+```
 
 ### Example Output (excerpt)
 
@@ -115,12 +158,54 @@ This script will:
 # Press Ctrl+C to disconnect gracefully
 ```
 
-### Method 1: Automatic Injection (CLI Direct)
+### Method 1: CLI Direct Mode
 
-The CLI tool can automatically inject the probe into running Qt processes using ptrace:
+The CLI tool provides multiple ways to attach to Qt processes:
+
+#### Basic Usage
 
 ```bash
+# Attach by PID (with automatic injection)
 ./build/cli/qt_spy_cli --pid <PID>
+
+# Connect to existing probe by server name
+./build/cli/qt_spy_cli --server qt_spy_<app_name>_<PID>
+```
+
+#### Advanced Options
+
+```bash
+# Interactive process selection menu
+./build/cli/qt_spy_cli --interactive
+
+# List all available Qt processes
+./build/cli/qt_spy_cli --list
+
+# Auto-attach to most recent Qt process
+./build/cli/qt_spy_cli --auto
+
+# Attach by process name
+./build/cli/qt_spy_cli --name rmmi
+
+# Attach by window title
+./build/cli/qt_spy_cli --title "My Application"
+
+# One-shot snapshot (exit after first output)
+./build/cli/qt_spy_cli --pid <PID> --snapshot-once
+
+# Disable automatic probe injection
+./build/cli/qt_spy_cli --pid <PID> --no-inject
+```
+
+#### Connection Management
+
+```bash
+# Set reconnection attempts (-1 for infinite)
+./build/cli/qt_spy_cli --pid <PID> --retries 5
+
+# Send specific requests
+./build/cli/qt_spy_cli --pid <PID> --select first-root
+./build/cli/qt_spy_cli --pid <PID> --properties <node_id>
 ```
 
 This works for most standard Qt applications running with system libraries.
