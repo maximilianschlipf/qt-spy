@@ -5,6 +5,7 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QCoreApplication>
+#include <QDir>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -12,6 +13,7 @@
 #include <QLocalSocket>
 #include <QFileInfo>
 #include <QProcess>
+#include <QRegExp>
 #include <QStringList>
 #include <QSet>
 #include <QTextStream>
@@ -38,6 +40,220 @@
 namespace {
 
 namespace protocol = qt_spy::protocol;
+
+struct QtProcessInfo {
+    qint64 pid = 0;
+    QString name;
+    QString commandLine;
+    QString windowTitle;
+    bool hasQtLibraries = false;
+    bool hasExistingProbe = false;
+    
+    QString displayName() const {
+        if (!windowTitle.isEmpty()) {
+            return QStringLiteral("%1 - \"%2\"").arg(name, windowTitle);
+        }
+        return name;
+    }
+};
+
+// Forward declarations
+bool checkForQtLibraries(qint64 pid);
+bool checkForExistingProbe(qint64 pid);
+
+QVector<QtProcessInfo> discoverQtProcesses() {
+    QVector<QtProcessInfo> qtProcesses;
+    
+#if defined(Q_OS_UNIX)
+    QProcess ps;
+    ps.start(QStringLiteral("ps"), {QStringLiteral("aux")});
+    if (!ps.waitForFinished(5000)) {
+        qWarning() << "Failed to execute ps command for process discovery";
+        return qtProcesses;
+    }
+    
+    const QByteArray output = ps.readAllStandardOutput();
+    const QStringList lines = QString::fromLocal8Bit(output).split('\n', Qt::SkipEmptyParts);
+    
+    for (int i = 1; i < lines.size(); ++i) { // Skip header line
+        const QString line = lines.at(i);
+        const QStringList fields = line.split(QRegExp("\\s+"), Qt::SkipEmptyParts);
+        
+        if (fields.size() < 11) continue;
+        
+        bool ok = false;
+        const qint64 pid = fields.at(1).toLongLong(&ok);
+        if (!ok || pid <= 0) continue;
+        
+        // Reconstruct command line from remaining fields
+        QStringList cmdParts = fields.mid(10);
+        const QString commandLine = cmdParts.join(' ');
+        
+        // Extract process info first
+        QtProcessInfo info;
+        info.pid = pid;
+        info.commandLine = commandLine;
+        
+        // Extract process name
+        const int spaceIndex = commandLine.indexOf(' ');
+        const QString fullPath = spaceIndex > 0 ? commandLine.left(spaceIndex) : commandLine;
+        info.name = QFileInfo(fullPath).baseName();
+        
+        // Check for Qt libraries by examining memory maps
+        info.hasQtLibraries = checkForQtLibraries(pid);
+        
+        // Only include processes that actually have Qt libraries
+        if (info.hasQtLibraries) {
+            // Check for existing qt-spy probe
+            info.hasExistingProbe = checkForExistingProbe(pid);
+            qtProcesses.append(info);
+        }
+    }
+#endif
+    
+    // Sort by most recent (highest PID typically means more recent)
+    std::sort(qtProcesses.begin(), qtProcesses.end(),
+              [](const QtProcessInfo &a, const QtProcessInfo &b) {
+                  return a.pid > b.pid;
+              });
+    
+    return qtProcesses;
+}
+
+bool checkForQtLibraries(qint64 pid) {
+#if defined(Q_OS_UNIX)
+    const QString mapsPath = QStringLiteral("/proc/%1/maps").arg(pid);
+    QFile mapsFile(mapsPath);
+    if (!mapsFile.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+    
+    const QByteArray content = mapsFile.readAll();
+    const QString mapsContent = QString::fromLocal8Bit(content);
+    
+    // Look for Qt library signatures (more comprehensive patterns)
+    return mapsContent.contains("libQt5", Qt::CaseInsensitive) ||
+           mapsContent.contains("libQt6", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt5Core", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt6Core", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt5Gui", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt6Gui", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt5Widgets", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt6Widgets", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt5Quick", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt6Quick", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt5Qml", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt6Qml", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt5Pdf", Qt::CaseInsensitive) ||
+           mapsContent.contains("Qt6Pdf", Qt::CaseInsensitive);
+#else
+    Q_UNUSED(pid);
+    return false;
+#endif
+}
+
+// Forward declarations
+QString detectProcessName(qint64 pid);
+
+bool checkForExistingProbe(qint64 pid) {
+    // Try to connect to potential qt-spy server names for this process
+    const QString processName = detectProcessName(pid);
+    const QStringList serverNames = {
+        qt_spy::defaultServerName(processName, pid),
+        qt_spy::defaultServerName(QString(), pid)
+    };
+    
+    for (const QString &serverName : serverNames) {
+        if (serverName.isEmpty()) continue;
+        
+        QLocalSocket testSocket;
+        testSocket.connectToServer(serverName);
+        if (testSocket.waitForConnected(100)) {
+            testSocket.disconnectFromServer();
+            return true;
+        }
+    }
+    return false;
+}
+
+QtProcessInfo findProcessByName(const QString &name) {
+    const QVector<QtProcessInfo> processes = discoverQtProcesses();
+    
+    for (const QtProcessInfo &process : processes) {
+        if (process.name.compare(name, Qt::CaseInsensitive) == 0) {
+            return process;
+        }
+    }
+    
+    // Try partial matches
+    for (const QtProcessInfo &process : processes) {
+        if (process.name.contains(name, Qt::CaseInsensitive)) {
+            return process;
+        }
+    }
+    
+    return QtProcessInfo{};
+}
+
+QtProcessInfo findProcessByTitle(const QString &title) {
+    const QVector<QtProcessInfo> processes = discoverQtProcesses();
+    
+    for (const QtProcessInfo &process : processes) {
+        if (process.windowTitle.contains(title, Qt::CaseInsensitive)) {
+            return process;
+        }
+    }
+    
+    return QtProcessInfo{};
+}
+
+void printQtProcessList(const QVector<QtProcessInfo> &processes, QTextStream &out) {
+    if (processes.isEmpty()) {
+        out << "No Qt processes found." << Qt::endl;
+        return;
+    }
+    
+    out << "Available Qt processes:" << Qt::endl;
+    for (int i = 0; i < processes.size(); ++i) {
+        const QtProcessInfo &process = processes.at(i);
+        out << QStringLiteral("  [%1] %2 (PID: %3)")
+               .arg(i + 1)
+               .arg(process.displayName())
+               .arg(process.pid);
+        
+        if (process.hasExistingProbe) {
+            out << " [probe active]";
+        }
+        out << Qt::endl;
+    }
+}
+
+int selectProcessInteractively(const QVector<QtProcessInfo> &processes, QTextStream &out, QTextStream &in) {
+    if (processes.isEmpty()) {
+        return -1;
+    }
+    
+    printQtProcessList(processes, out);
+    out << Qt::endl;
+    out << "Select process [1-" << processes.size() << "] (or 0 to exit): ";
+    out.flush();
+    
+    QString input;
+    input = in.readLine().trimmed();
+    
+    bool ok = false;
+    const int choice = input.toInt(&ok);
+    
+    if (!ok || choice < 0 || choice > processes.size()) {
+        return -1;
+    }
+    
+    if (choice == 0) {
+        return -1; // User chose to exit
+    }
+    
+    return choice - 1; // Convert to 0-based index
+}
 
 QString detectProcessName(qint64 pid)
 {
@@ -79,8 +295,23 @@ ResolvedServerName resolveServerName(const QCommandLineParser &parser,
         }
         const QString processName = detectProcessName(pid);
         QStringList candidates;
+        
+        // First, check for existing sockets in /tmp for this PID
+        QDir tmpDir("/tmp");
+        QStringList socketFilters;
+        socketFilters << QStringLiteral("qt_spy_*_%1").arg(QString::number(pid));
+        QStringList existingSockets = tmpDir.entryList(socketFilters, QDir::AllEntries | QDir::System);
+        
+        // Add existing sockets as primary candidates
+        for (const QString &socketFile : existingSockets) {
+            if (!candidates.contains(socketFile)) {
+                candidates << socketFile;
+            }
+        }
+        
+        // Add generated candidates as fallbacks
         const QString primary = qt_spy::defaultServerName(processName, pid);
-        if (!primary.isEmpty()) {
+        if (!primary.isEmpty() && !candidates.contains(primary)) {
             candidates << primary;
         }
         const QString sanitizedFallback = qt_spy::defaultServerName(QString(), pid);
@@ -104,6 +335,132 @@ ResolvedServerName resolveServerName(const QCommandLineParser &parser,
 
     return ResolvedServerName{QStringList(), -1,
                               QStringLiteral("Please provide either --pid or --server.")};
+}
+
+ResolvedServerName resolveServerNameEnhanced(const QCommandLineParser &parser,
+                                           const QCommandLineOption &serverOption,
+                                           const QCommandLineOption &pidOption,
+                                           const QCommandLineOption &listOption,
+                                           const QCommandLineOption &autoOption,
+                                           const QCommandLineOption &nameOption,
+                                           const QCommandLineOption &titleOption,
+                                           const QCommandLineOption &interactiveOption,
+                                           QTextStream &out,
+                                           QTextStream &err)
+{
+    // Handle --list option first
+    if (parser.isSet(listOption)) {
+        const QVector<QtProcessInfo> processes = discoverQtProcesses();
+        printQtProcessList(processes, out);
+        exit(EXIT_SUCCESS);
+    }
+    
+    // Use original logic for explicit --server or --pid
+    if (parser.isSet(serverOption) || parser.isSet(pidOption)) {
+        return resolveServerName(parser, serverOption, pidOption);
+    }
+    
+    // Discover Qt processes for user-friendly options
+    const QVector<QtProcessInfo> processes = discoverQtProcesses();
+    
+    if (processes.isEmpty()) {
+        return ResolvedServerName{QStringList(), -1,
+                                  QStringLiteral("No Qt processes found. Try running a Qt application first.")};
+    }
+    
+    QtProcessInfo selectedProcess;
+    
+    // Handle --interactive option
+    if (parser.isSet(interactiveOption)) {
+        QTextStream in(stdin);
+        const int index = selectProcessInteractively(processes, out, in);
+        if (index < 0 || index >= processes.size()) {
+            return ResolvedServerName{QStringList(), -1,
+                                      QStringLiteral("No process selected or invalid selection.")};
+        }
+        selectedProcess = processes.at(index);
+    }
+    // Handle --auto option
+    else if (parser.isSet(autoOption)) {
+        selectedProcess = processes.first(); // Most recent process (sorted by PID descending)
+        out << "Auto-attaching to: " << selectedProcess.displayName() 
+            << " (PID: " << selectedProcess.pid << ")" << Qt::endl;
+    }
+    // Handle --name option
+    else if (parser.isSet(nameOption)) {
+        const QString name = parser.value(nameOption);
+        selectedProcess = findProcessByName(name);
+        if (selectedProcess.pid == 0) {
+            return ResolvedServerName{QStringList(), -1,
+                                      QStringLiteral("No Qt process found with name: %1").arg(name)};
+        }
+        out << "Found process by name: " << selectedProcess.displayName() 
+            << " (PID: " << selectedProcess.pid << ")" << Qt::endl;
+    }
+    // Handle --title option
+    else if (parser.isSet(titleOption)) {
+        const QString title = parser.value(titleOption);
+        selectedProcess = findProcessByTitle(title);
+        if (selectedProcess.pid == 0) {
+            return ResolvedServerName{QStringList(), -1,
+                                      QStringLiteral("No Qt process found with window title containing: %1").arg(title)};
+        }
+        out << "Found process by title: " << selectedProcess.displayName() 
+            << " (PID: " << selectedProcess.pid << ")" << Qt::endl;
+    }
+    // No specific option - show helpful message
+    else {
+        err << "Multiple Qt processes available. Use one of these options:" << Qt::endl;
+        err << "  --interactive  : Show selection menu" << Qt::endl;
+        err << "  --auto         : Auto-attach to most recent process" << Qt::endl;
+        err << "  --name <name>  : Attach by process name" << Qt::endl;
+        err << "  --list         : Show all available processes" << Qt::endl;
+        err << Qt::endl;
+        printQtProcessList(processes, err);
+        return ResolvedServerName{QStringList(), -1,
+                                  QStringLiteral("Please specify which process to attach to.")};
+    }
+    
+    // Convert selected process to ResolvedServerName
+    if (selectedProcess.pid > 0) {
+        const QString processName = detectProcessName(selectedProcess.pid);
+        QStringList candidates;
+        
+        // First, check for existing sockets in /tmp for this PID
+        QDir tmpDir("/tmp");
+        QStringList socketFilters;
+        socketFilters << QStringLiteral("qt_spy_*_%1").arg(QString::number(selectedProcess.pid));
+        QStringList existingSockets = tmpDir.entryList(socketFilters, QDir::AllEntries | QDir::System);
+        
+        // Add existing sockets as primary candidates
+        for (const QString &socketFile : existingSockets) {
+            if (!candidates.contains(socketFile)) {
+                candidates << socketFile;
+            }
+        }
+        
+        // Add generated candidates as fallbacks
+        const QString primary = qt_spy::defaultServerName(processName, selectedProcess.pid);
+        if (!primary.isEmpty() && !candidates.contains(primary)) {
+            candidates << primary;
+        }
+        const QString sanitizedFallback = qt_spy::defaultServerName(QString(), selectedProcess.pid);
+        if (!sanitizedFallback.isEmpty() && !candidates.contains(sanitizedFallback)) {
+            candidates << sanitizedFallback;
+        }
+        const QString numericFallback = QStringLiteral("qt_spy_%1").arg(QString::number(selectedProcess.pid));
+        if (!candidates.contains(numericFallback)) {
+            candidates << numericFallback;
+        }
+        
+        ResolvedServerName resolved;
+        resolved.names = candidates;
+        resolved.pid = selectedProcess.pid;
+        return resolved;
+    }
+    
+    return ResolvedServerName{QStringList(), -1,
+                              QStringLiteral("Failed to resolve process information.")};
 }
 
 #if defined(Q_OS_UNIX) && defined(__x86_64__)
@@ -773,6 +1130,9 @@ public:
 
     void start();
 
+public slots:
+    void requestGracefulShutdown() { exitWithCode(EXIT_SUCCESS); }
+
 signals:
     void finished(int exitCode);
 
@@ -1373,6 +1733,29 @@ int main(int argc, char *argv[])
                                     QStringLiteral("name"));
     parser.addOption(serverOption);
 
+    // User-friendly attachment options
+    QCommandLineOption listOption(QStringLiteral("list"),
+                                  QStringLiteral("List available Qt processes and exit."));
+    parser.addOption(listOption);
+
+    QCommandLineOption autoOption({QStringLiteral("a"), QStringLiteral("auto")},
+                                  QStringLiteral("Automatically attach to the most recent Qt process."));
+    parser.addOption(autoOption);
+
+    QCommandLineOption nameOption({QStringLiteral("n"), QStringLiteral("name")},
+                                  QStringLiteral("Attach to process by name (e.g., 'rmmi', 'myapp')."),
+                                  QStringLiteral("process_name"));
+    parser.addOption(nameOption);
+
+    QCommandLineOption titleOption({QStringLiteral("t"), QStringLiteral("title")},
+                                   QStringLiteral("Attach to process by window title."),
+                                   QStringLiteral("window_title"));
+    parser.addOption(titleOption);
+
+    QCommandLineOption interactiveOption({QStringLiteral("i"), QStringLiteral("interactive")},
+                                         QStringLiteral("Show interactive process selection menu."));
+    parser.addOption(interactiveOption);
+
     QCommandLineOption retriesOption(QStringLiteral("retries"),
                                      QStringLiteral("Number of reconnect attempts (-1 for infinite)."),
                                      QStringLiteral("count"),
@@ -1399,9 +1782,14 @@ int main(int argc, char *argv[])
 
     parser.process(app);
 
-    const ResolvedServerName resolved = resolveServerName(parser, serverOption, pidOption);
+    QTextStream out(stdout);
+    QTextStream err(stderr);
+    
+    const ResolvedServerName resolved = resolveServerNameEnhanced(
+        parser, serverOption, pidOption, listOption, autoOption, 
+        nameOption, titleOption, interactiveOption, out, err);
     if (resolved.names.isEmpty()) {
-        QTextStream(stderr) << resolved.error << Qt::endl;
+        err << resolved.error << Qt::endl;
         return EXIT_FAILURE;
     }
 
@@ -1440,6 +1828,24 @@ int main(int argc, char *argv[])
         client->deleteLater();
         QMetaObject::invokeMethod(&app, [exitCode]() { QCoreApplication::exit(exitCode); },
                                   Qt::QueuedConnection);
+    });
+    
+    // Connect app quit to client graceful shutdown
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, client, &Client::requestGracefulShutdown);
+
+    // Setup signal handlers for graceful shutdown
+    signal(SIGINT, [](int) {
+        QTextStream(stderr) << "\nqt-spy cli: received SIGINT, disconnecting gracefully..." << Qt::endl;
+        QMetaObject::invokeMethod(QCoreApplication::instance(), []() {
+            QCoreApplication::quit();
+        }, Qt::QueuedConnection);
+    });
+    
+    signal(SIGTERM, [](int) {
+        QTextStream(stderr) << "\nqt-spy cli: received SIGTERM, disconnecting gracefully..." << Qt::endl;
+        QMetaObject::invokeMethod(QCoreApplication::instance(), []() {
+            QCoreApplication::quit();
+        }, Qt::QueuedConnection);
     });
 
     QTimer::singleShot(0, client, &Client::start);

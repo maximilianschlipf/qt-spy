@@ -70,9 +70,52 @@ In addition, `libqt_spy_bridge.a` exposes the reusable bridge client in `bridge/
 
 ## Attaching to Existing Applications
 
-For applications that weren't started with the probe embedded, qt-spy provides two approaches:
+For applications that weren't started with the probe embedded, qt-spy provides several approaches:
 
-### Method 1: Automatic Injection (Default)
+### Interactive Mode (Recommended)
+
+qt-spy includes interactive scripts for easy process selection and connection:
+
+#### 1. Interactive Injection
+
+```bash
+./scripts/inject_qt_spy.sh
+```
+
+This script will:
+
+- Automatically discover running Qt processes
+- Present an interactive menu for process selection
+- Use GDB to inject the probe into the selected process
+- Handle the injection process automatically
+
+#### 2. Interactive Connection
+
+```bash
+./scripts/connect_qt_spy.sh
+```
+
+This script will:
+
+- Discover processes with qt-spy probes already injected
+- Present an interactive menu for connection
+- Establish a live connection showing real-time object tree updates
+- Handle graceful disconnection when cancelled (Ctrl+C)
+
+**Example workflow:**
+
+```bash
+# Step 1: Inject into a running Qt process
+./scripts/inject_qt_spy.sh
+# Select process from menu (e.g., "2" for rmmi)
+
+# Step 2: Connect and monitor in real-time
+./scripts/connect_qt_spy.sh  
+# Select same process, see live object tree updates
+# Press Ctrl+C to disconnect gracefully
+```
+
+### Method 1: Automatic Injection (CLI Direct)
 
 The CLI tool can automatically inject the probe into running Qt processes using ptrace:
 
