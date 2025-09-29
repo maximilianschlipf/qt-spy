@@ -134,6 +134,7 @@ private:
     void sendMessage(const QJsonObject &message);
     void sendError(const QString &code, const QString &text, const QJsonObject &context = {});
     void sendHello();
+    void resetConnectionState(); // Reset state without cleanup for reconnections
 
     QJsonObject buildSnapshotPayload();
     QJsonObject serializeNode(QObject *object, const QString &parentId);
@@ -198,7 +199,15 @@ ProbeConnection::ProbeConnection(QLocalSocket *socket, Probe *probe)
 ProbeConnection::~ProbeConnection()
 {
     m_topLevelPoll.stop();
-    cleanup();
+    
+    // For injected probes, avoid cleanup in destructor to prevent interference with host application
+    const bool isLikelyInjected = (m_probe && m_probe->parent() == QCoreApplication::instance());
+    
+    if (!isLikelyInjected) {
+        // Only cleanup for non-injected probes (tests, etc.)
+        cleanup();
+    }
+    
     if (m_socket) {
         disconnect(m_socket, nullptr, this, nullptr);
         if (m_socket->state() == QLocalSocket::ConnectedState) {
@@ -270,7 +279,16 @@ void ProbeConnection::onReadyRead()
 void ProbeConnection::onDisconnected()
 {
     m_topLevelPoll.stop();
-    cleanup();
+    
+    // For injected probes, avoid cleanup entirely to prevent interference with host application
+    const bool isLikelyInjected = (m_probe && m_probe->parent() == QCoreApplication::instance());
+    
+    if (!isLikelyInjected) {
+        // Only cleanup for non-injected probes (tests, etc.)
+        cleanup();
+    }
+    // For injected probes, just stop polling and emit closed - no cleanup
+    
     emit closed(this);
 }
 
@@ -415,7 +433,15 @@ void ProbeConnection::handleDetach(const QJsonObject &message)
 
     m_handshakeComplete = false;
     m_topLevelPoll.stop();
-    cleanup();
+    
+    // For injected probes, avoid cleanup entirely to prevent interference with host application
+    const bool isLikelyInjected = (m_probe && m_probe->parent() == QCoreApplication::instance());
+    
+    if (!isLikelyInjected) {
+        // Only cleanup for non-injected probes (tests, etc.)
+        cleanup();
+    }
+    // For injected probes, just disconnect without cleanup - leave everything intact
 
     if (m_socket) {
         m_socket->flush();
@@ -748,13 +774,22 @@ void ProbeConnection::installRecursive(QObject *object, const QString &parentId,
     const bool alreadyTracked = m_tracked.contains(object);
     if (!alreadyTracked) {
         m_tracked.insert(object);
-        object->installEventFilter(this);
-        QObject::connect(object,
-                         &QObject::destroyed,
-                         this,
-                         &ProbeConnection::onObjectDestroyed,
-                         Qt::UniqueConnection);
-        observeProperties(object);
+        
+        // For injected probes, be extremely conservative - don't install event filters or property observers
+        const bool isLikelyInjected = (m_probe && m_probe->parent() == QCoreApplication::instance());
+        
+        if (!isLikelyInjected) {
+            // Only install filters and observers for non-injected probes
+            object->installEventFilter(this);
+            observeProperties(object);
+            // Only connect to destroyed signal for non-injected probes
+            QObject::connect(object,
+                             &QObject::destroyed,
+                             this,
+                             &ProbeConnection::onObjectDestroyed,
+                             Qt::UniqueConnection);
+        }
+        // For injected probes, don't connect to destroyed signal to avoid interference
     }
 
     if (announce && !alreadyTracked) {
@@ -778,9 +813,23 @@ void ProbeConnection::removeRecursive(QObject *object, bool emitEvent)
         removeRecursive(child, emitEvent);
     }
 
-    object->removeEventFilter(this);
-    QObject::disconnect(object, nullptr, this, nullptr);
-    unobserveProperties(object);
+    // Never interfere with the QCoreApplication instance itself - this could kill the app
+    if (object == QCoreApplication::instance()) {
+        m_tracked.remove(object);
+        return;
+    }
+
+    // For injected probes, be extremely conservative about cleanup - do nothing
+    const bool isLikelyInjected = (m_probe && m_probe->parent() == QCoreApplication::instance());
+    
+    if (!isLikelyInjected) {
+        // Only do cleanup for non-injected probes
+        object->removeEventFilter(this);
+        unobserveProperties(object);
+        // Only disconnect signals for non-injected probes
+        QObject::disconnect(object, nullptr, this, nullptr);
+    }
+    // For injected probes, don't disconnect anything - leave everything intact
 
     m_tracked.remove(object);
     const QString parentId = m_parentByObject.take(object);
@@ -861,8 +910,26 @@ QVector<QObject *> ProbeConnection::ensureRootsTracked(bool announce)
             candidates.insert(window);
         }
 
+        // Be more selective about application children - avoid tracking critical system objects
         const auto appChildren = app->children();
         for (QObject *child : appChildren) {
+            // Skip objects that are likely critical to application lifecycle
+            const QString childClassName = child->metaObject()->className();
+            const QString childObjectName = child->objectName();
+            
+            // Skip critical Qt internal objects that could affect application stability
+            if (childClassName.startsWith("QSocketNotifier") ||
+                childClassName.startsWith("QEventDispatcher") ||
+                childClassName.startsWith("QTimer") ||
+                childClassName.startsWith("QThread") ||
+                childClassName.contains("SystemTrayIcon") ||
+                childClassName.contains("DBus") ||
+                childObjectName.startsWith("qt_") ||
+                childObjectName.startsWith("_q_")) {
+                continue;
+            }
+            
+            // Only track user-visible or user-created objects
             candidates.insert(child);
         }
     }
@@ -894,20 +961,63 @@ void ProbeConnection::refreshTopLevelObjects()
     ensureRootsTracked(true);
 }
 
+void ProbeConnection::resetConnectionState()
+{
+    // Reset connection-specific state without cleaning up tracked objects
+    // This allows injected probes to handle new connections gracefully
+    m_handshakeComplete = false;
+    m_selectedId.clear();
+    m_readBuffer.clear();
+}
+
 void ProbeConnection::cleanup()
 {
-    const auto trackedSnapshot = m_tracked;
-    for (const QObject *object : trackedSnapshot) {
-        removeRecursive(const_cast<QObject *>(object), false);
+    // For injected probes, we should be very conservative about cleanup
+    // to avoid interfering with the host application's normal operation.
+    // Instead of aggressive cleanup, we'll do passive cleanup that just
+    // stops tracking without disrupting the application.
+    
+    // Stop the polling timer first
+    m_topLevelPoll.stop();
+    
+    // Determine if this is likely an injected probe by checking if the probe's parent
+    // is the QCoreApplication instance (which happens during injection)
+    const bool isLikelyInjected = (m_probe && m_probe->parent() == QCoreApplication::instance());
+    
+    if (isLikelyInjected) {
+        // Passive cleanup - just clear our tracking without touching the objects
+        // This prevents interference with the host application's normal operation
+        
+        // Only disconnect our specific property connections, don't touch the objects
+        for (auto it = m_propertyConnections.begin(); it != m_propertyConnections.end(); ++it) {
+            for (const QMetaObject::Connection &connection : it.value()) {
+                QObject::disconnect(connection);
+            }
+        }
+        
+        // Clear all tracking data structures without touching the tracked objects
+        m_propertyConnections.clear();
+        m_propertyBySignalIndex.clear();
+        m_parentByObject.clear();
+        m_idsByObject.clear();
+        m_objectById.clear();
+        m_tracked.clear();
+        m_selectedId.clear();
+    } else {
+        // Aggressive cleanup for standalone probes (tests, etc.)
+        const auto trackedSnapshot = m_tracked;
+        for (const QObject *object : trackedSnapshot) {
+            removeRecursive(const_cast<QObject *>(object), false);
+        }
+        
+        m_propertyConnections.clear();
+        m_propertyBySignalIndex.clear();
+        m_parentByObject.clear();
+        m_idsByObject.clear();
+        m_objectById.clear();
+        m_tracked.clear();
+        m_selectedId.clear();
     }
-
-    m_propertyConnections.clear();
-    m_propertyBySignalIndex.clear();
-    m_parentByObject.clear();
-    m_idsByObject.clear();
-    m_objectById.clear();
-    m_tracked.clear();
-    m_selectedId.clear();
 }
 
 // Probe implementation
