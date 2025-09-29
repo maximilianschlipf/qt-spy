@@ -1,6 +1,63 @@
 # qt-spy
 
-qt-spy is an inspect1. Launch the sample MMI in one terminal:
+qt-spy is an inspector tool that attaches to running Qt 5/6 applications, enumerates the QObject/QWidget hierarchy, and provides real-time monitoring of object properties. It includes both a command-line interface and a graphical inspector application.
+
+## Purpose & Architecture
+
+qt-spy consists of several components:
+
+- **Probe**: A library (`libqt_spy_probe_bootstrap.so`) injected into target Qt applications that walks the object hierarchy and exposes data via QLocalSocket
+- **Bridge Client**: Reusable library (`libqt_spy_bridge.a`) that connects to probe sockets and handles protocol communication
+- **CLI Tool**: Command-line interface (`qt_spy_cli`) for scripting and automated inspection
+- **GUI Inspector**: Qt-based graphical application (`qt_spy_inspector`) with tree view and property inspector
+- **Sample Applications**: Test applications with and without embedded probes
+
+## Technology Stack
+
+- **Qt**: 5.15+ (Qt6 compatible)
+- **Build System**: CMake 3.16+
+- **Language**: C++17
+- **Platform**: Linux (x86_64), with Unix-specific injection features
+- **Injection Method**: GDB-based injection via shell script (reliable across environments)
+- **Protocol**: JSON over QLocalSocket
+
+## Building
+
+```bash
+# Clean configuration and build
+cmake -S . -B build
+cmake --build build --parallel
+```
+
+The build produces several executables and libraries in `build/`:
+
+**Main Applications:**
+
+- `qt_spy_cli`: Command-line interface for scripting and automated inspection
+- `qt_spy_inspector`: GUI application with interactive tree view and property inspector
+
+**Sample Applications:**
+
+- `sample_mmi`: Demo Qt Widgets application with automatically embedded qt-spy probe
+- `sample_plain_mmi`: Plain Qt Widgets application without probe (for testing injection)
+
+**Libraries:**
+
+- `libqt_spy_bridge.a`: Reusable client library for connecting to probes
+- `libqt_spy_probe_bootstrap.so`: Injectable probe library
+
+## Quick Start
+
+### Testing with Sample Applications
+
+qt-spy includes two sample applications for testing:
+
+- **`sample_mmi`**: Has the qt-spy probe embedded automatically (for basic testing)
+- **`sample_plain_mmi`**: Plain Qt application without probe (for testing injection)
+
+### Running with Embedded Probe
+
+1. Launch the sample MMI in one terminal:
 
    ```bash
    ./build/sample_mmi/sample_mmi &
@@ -8,34 +65,63 @@ qt-spy is an inspect1. Launch the sample MMI in one terminal:
 
    The window titled "Sample MMI" appears. The probe starts automatically and logs the server name to stdout (e.g. `qt_spy_sample_mmi_12345`).
 
-1. Discover the PID (if needed) to derive the server name:
+2. Discover the PID (if needed) to derive the server name:
 
    ```bash
    pidof sample_mmi
    ```
 
-1. From another terminal, run the CLI with either the PID or the explicit server name:
+3. From another terminal, run the CLI with either the PID or the explicit server name:
 
    ```bash
    ./build/cli/qt_spy_cli --pid <PID>
    # or
    ./build/cli/qt_spy_cli --server qt_spy_sample_mmi_<PID>
-   ``` attaches to a running Qt 5/6 MMI, enumerates the QObject/QWidget hierarchy, and returns a JSON snapshot of properties. Phase 1 extends the spike with a reusable bridge client, incremental update plumbing, and a CLI that can reconnect or inject the probe into plain Qt processes on demand.
+   ```ations, enumerates the QObject/QWidget hierarchy, and provides real-time monitoring of object properties. It includes both a command-line interface and a graphical inspector application.
+
+## Purpose & Architecture
+
+qt-spy consists of several components:
+
+- **Probe**: A library (`libqt_spy_probe_bootstrap.so`) injected into target Qt applications that walks the object hierarchy and exposes data via QLocalSocket
+- **Bridge Client**: Reusable library (`libqt_spy_bridge.a`) that connects to probe sockets and handles protocol communication
+- **CLI Tool**: Command-line interface (`qt_spy_cli`) for scripting and automated inspection
+- **GUI Inspector**: Qt-based graphical application (`qt_spy_inspector`) with tree view and property inspector
+- **Sample Applications**: Test applications with and without embedded probes
+
+## Technology Stack
+
+- **Qt**: 5.15+ (Qt6 compatible)
+- **Build System**: CMake 3.16+
+- **Language**: C++17
+- **Platform**: Linux (x86_64), with Unix-specific injection features
+- **Injection Method**: GDB-based injection via shell script (reliable across environments)
+- **Protocol**: JSON over QLocalSocket
 
 ## Building
 
 ```bash
+# Clean configuration and build
 cmake -S . -B build
-cmake --build build
+cmake --build build --parallel
 ```
 
-The build produces three executables in `build/`:
+The build produces several executables and libraries in `build/`:
 
-- `sample_mmi`: a demo Qt Widgets application that automatically embeds the qt-spy probe.
-- `sample_plain_mmi`: a plain Qt Widgets application without embedded probe (for testing injection).
-- `qt_spy_cli`: a console client that connects to the probe and prints a hierarchy dump.
+**Main Applications:**
 
-In addition, `libqt_spy_bridge.a` exposes the reusable bridge client in `bridge/include/qt_spy/bridge_client.h` for the upcoming inspector UI.
+- `qt_spy_cli`: Command-line interface for scripting and automated inspection
+- `qt_spy_inspector`: GUI application with interactive tree view and property inspector
+
+**Sample Applications:**
+
+- `sample_mmi`: Demo Qt Widgets application with automatically embedded qt-spy probe
+- `sample_plain_mmi`: Plain Qt Widgets application without probe (for testing injection)
+
+**Libraries:**
+
+- `libqt_spy_bridge.a`: Reusable client library for connecting to probes
+- `libqt_spy_probe_bootstrap.so`: Injectable probe library
 
 ## Quick Start
 
@@ -254,11 +340,65 @@ pidof rmmi
   - The application runs in containers or cross-compiled environments
   - You have control over application startup
 
+## GUI Inspector
+
+qt-spy includes a fully-functional graphical inspector application for interactive object hierarchy exploration:
+
+```bash
+# Launch the GUI inspector
+./build/inspector/qt_spy_inspector
+```
+
+### Features
+
+- **✅ Process Discovery**: Automatic detection of running Qt applications with probe status indication
+- **✅ One-Click Injection**: Automatic probe injection into processes that don't have probes yet
+- **✅ Real-time Connection**: Live monitoring with automatic reconnection handling
+- **✅ Interactive Tree View**: Expandable/collapsible object hierarchy browser
+- **✅ Property Inspector**: Detailed property viewer for selected objects with type information
+- **✅ Connection Management**: Robust error handling and connection state management
+
+### Usage
+
+1. **Launch the inspector**: `./build/inspector/qt_spy_inspector`
+2. **Connect to process**: Use "File → Connect to Process" menu (Ctrl+O)
+3. **Select target**: Choose from auto-discovered Qt applications (probe status shown)
+4. **Automatic setup**: Injection happens automatically for processes without probes
+5. **Explore hierarchy**: Click to expand/collapse object tree nodes
+6. **View properties**: Select any object to see its detailed properties in the right panel
+
+**Verified working with**: MMI applications, sample applications, and standard Qt widgets
+
+## Documentation
+
+- `README.md` - This file, complete project overview
+- `HANDOFF.md` - Technical handoff documentation for developers  
+- `IMPLEMENTATION_PLAN.md` - Original planning document (archived, development complete)
+
+## Recent Decisions & Changes
+
+### Latest Updates (September 2025)
+
+- **✅ COMPLETE**: Unified injection approach - Both CLI and GUI now use the proven `inject_qt_spy.sh` shell script
+- **✅ COMPLETE**: Removed legacy ptrace injection code - Eliminated complex, platform-specific injection implementations
+- **✅ COMPLETE**: Code cleanup - Removed redundant debug logging, unused includes, and obsolete injection methods
+- **✅ COMPLETE**: Streamlined codebase - Single, reliable injection method shared across all components
+- **✅ COMPLETE**: Enhanced error handling - Clean error messages and robust connection management
+- **✅ VERIFIED**: Full workflow testing - Both CLI and GUI inspector successfully connect to MMI applications
+
+### Technical Decisions
+
+- **Injection Strategy**: GDB-based shell script (`inject_qt_spy.sh`) - proven reliable across environments
+- **Connection Protocol**: JSON over QLocalSocket for simplicity and cross-platform compatibility  
+- **GUI Framework**: Qt Widgets for native look and feel
+- **Build System**: CMake with clean dependency management
+- **Testing**: Comprehensive test suite covering injection, connection, and reconnection scenarios
+
 ## Limitations and Notes
 
 - The probe currently walks `QWidget` hierarchies; QML/Qt Quick items are not covered yet.
 - Only properties readable via `QMetaProperty::read` and dynamic properties are emitted; complex types fall back to string serialization.
 - The server name schema is `qt_spy_<applicationName>_<pid>`; the CLI derives it automatically when given a PID.
-- Automatic probe injection currently relies on ptrace/`dlopen` and is supported on Unix-like systems. Use `--no-inject` to skip it when elevated debugging is unavailable.
+- Probe injection currently relies on GDB and is supported on Unix-like systems. Use `--no-inject` to skip it when debugging tools are unavailable.
 - `--pid` lookups currently rely on `/proc/<PID>/comm`, so they are limited to Unix-like systems; use `--server` on other platforms.
 - LD_PRELOAD method requires restarting the target application but is more reliable across different runtime environments.

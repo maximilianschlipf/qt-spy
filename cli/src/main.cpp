@@ -5,12 +5,14 @@
 #include <QCommandLineOption>
 #include <QCommandLineParser>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLocalSocket>
+#include <QFileDevice>
 #include <QFileInfo>
 #include <QProcess>
 #include <QRegExp>
@@ -20,15 +22,7 @@
 #include <QTimer>
 #include <QVector>
 
-#if defined(Q_OS_UNIX)
-#include <dlfcn.h>
-#include <errno.h>
 #include <signal.h>
-#include <sys/ptrace.h>
-#include <sys/user.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
 
 #include <cstring>
 
@@ -463,619 +457,6 @@ ResolvedServerName resolveServerNameEnhanced(const QCommandLineParser &parser,
                               QStringLiteral("Failed to resolve process information.")};
 }
 
-#if defined(Q_OS_UNIX) && defined(__x86_64__)
-
-class PtraceInjector {
-public:
-    PtraceInjector(pid_t pid, QTextStream &log)
-        : m_pid(pid)
-        , m_log(log)
-    {
-    }
-
-    bool inject(const QString &libraryPath)
-    {
-        if (libraryPath.isEmpty()) {
-            m_log << "qt-spy cli: bootstrap library path is empty; cannot inject." << Qt::endl;
-            return false;
-        }
-
-        if (!QFileInfo(libraryPath).exists()) {
-            m_log << "qt-spy cli: bootstrap library not found at '" << libraryPath << "'." << Qt::endl;
-            return false;
-        }
-
-        if (!attach()) {
-            return false;
-        }
-
-        bool success = false;
-        MemoryBackup stringBackup;
-        const QString absolutePath = QFileInfo(libraryPath).absoluteFilePath();
-        QByteArray pathBytes = QFile::encodeName(absolutePath);
-        pathBytes.append('\0');
-
-        do {
-            user_regs_struct regs{};
-            if (!getRegisters(regs)) {
-                break;
-            }
-
-            const quint64 dlopenAddr = resolveRemoteAddress(reinterpret_cast<void *>(dlopen));
-            if (dlopenAddr == 0) {
-                break;
-            }
-
-            // Reserve space on the target stack for the library path.
-            const quint64 pathAddress = (regs.rsp - 0x800) & ~static_cast<quint64>(0x7);
-            if (!writeRemote(pathAddress, pathBytes, &stringBackup)) {
-                break;
-            }
-
-            QVector<quint64> args;
-            args << pathAddress << static_cast<quint64>(RTLD_NOW | RTLD_GLOBAL);
-
-            quint64 result = 0;
-            if (!callRemote(dlopenAddr, args, &result)) {
-                break;
-            }
-
-            if (result == 0) {
-                m_log << "qt-spy cli: dlopen returned null while injecting '" << absolutePath
-                      << "'." << Qt::endl;
-                break;
-            }
-
-            success = true;
-        } while (false);
-
-        if (!stringBackup.data.isEmpty()) {
-            restoreMemory(stringBackup);
-        }
-
-        detach();
-        return success;
-    }
-
-private:
-    struct MemoryBackup {
-        quint64 address = 0;
-        QByteArray data;
-    };
-
-    bool attach()
-    {
-        if (m_attached) {
-            return true;
-        }
-
-        if (ptrace(PTRACE_ATTACH, m_pid, nullptr, nullptr) == -1) {
-            reportErrno(QStringLiteral("ptrace attach failed (check ptrace_scope or permissions)"));
-            return false;
-        }
-
-        int status = 0;
-        if (waitpid(m_pid, &status, 0) == -1) {
-            reportErrno(QStringLiteral("waitpid after attach failed"));
-            return false;
-        }
-
-        if (!WIFSTOPPED(status)) {
-            m_log << "qt-spy cli: target process did not stop after ptrace attach." << Qt::endl;
-            return false;
-        }
-
-        m_attached = true;
-        return true;
-    }
-
-    void detach()
-    {
-        if (!m_attached) {
-            return;
-        }
-
-        if (ptrace(PTRACE_DETACH, m_pid, nullptr, nullptr) == -1) {
-            reportErrno(QStringLiteral("ptrace detach failed"));
-        }
-        m_attached = false;
-    }
-
-    bool getRegisters(user_regs_struct &regs)
-    {
-        if (ptrace(PTRACE_GETREGS, m_pid, nullptr, &regs) == -1) {
-            reportErrno(QStringLiteral("ptrace getregs failed"));
-            return false;
-        }
-        return true;
-    }
-
-    bool setRegisters(const user_regs_struct &regs)
-    {
-        if (ptrace(PTRACE_SETREGS, m_pid, nullptr, &regs) == -1) {
-            reportErrno(QStringLiteral("ptrace setregs failed"));
-            return false;
-        }
-        return true;
-    }
-
-    bool writeRemote(quint64 address, const QByteArray &data, MemoryBackup *backup)
-    {
-        if (!backup) {
-            return false;
-        }
-
-        const qsizetype roundedLength = ((data.size() + 7) / 8) * 8;
-        QByteArray padded = data;
-        padded.resize(roundedLength);
-
-        backup->address = address;
-        backup->data = readRemote(address, roundedLength);
-        if (backup->data.size() != roundedLength) {
-            backup->data.clear();
-            return false;
-        }
-
-        for (qsizetype offset = 0; offset < roundedLength; offset += 8) {
-            quint64 word = 0;
-            std::memcpy(&word, padded.constData() + offset, sizeof(word));
-            if (ptrace(PTRACE_POKEDATA,
-                       m_pid,
-                       reinterpret_cast<void *>(address + static_cast<quint64>(offset)),
-                       reinterpret_cast<void *>(word)) == -1) {
-                reportErrno(QStringLiteral("ptrace pokedata failed"));
-                restoreMemory(*backup);
-                backup->data.clear();
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    bool restoreMemory(const MemoryBackup &backup)
-    {
-        if (backup.data.isEmpty()) {
-            return true;
-        }
-
-        for (qsizetype offset = 0; offset < backup.data.size(); offset += 8) {
-            quint64 word = 0;
-            std::memcpy(&word, backup.data.constData() + offset, sizeof(word));
-            if (ptrace(PTRACE_POKEDATA,
-                       m_pid,
-                       reinterpret_cast<void *>(backup.address + static_cast<quint64>(offset)),
-                       reinterpret_cast<void *>(word)) == -1) {
-                reportErrno(QStringLiteral("ptrace restore pokedata failed"));
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    QByteArray readRemote(quint64 address, qsizetype length)
-    {
-        QByteArray buffer;
-        buffer.resize(length);
-
-        for (qsizetype offset = 0; offset < length; offset += 8) {
-            errno = 0;
-            const long word = ptrace(PTRACE_PEEKDATA,
-                                     m_pid,
-                                     reinterpret_cast<void *>(address + static_cast<quint64>(offset)),
-                                     nullptr);
-            if (word == -1 && errno != 0) {
-                reportErrno(QStringLiteral("ptrace peekdata failed"));
-                buffer.clear();
-                return buffer;
-            }
-            std::memcpy(buffer.data() + offset, &word, sizeof(word));
-        }
-
-        return buffer;
-    }
-
-    bool callRemote(quint64 functionAddr, const QVector<quint64> &arguments, quint64 *result)
-    {
-        user_regs_struct regs{};
-        if (!getRegisters(regs)) {
-            return false;
-        }
-        const user_regs_struct original = regs;
-
-        auto restoreState = [this, &original](const QVector<MemoryBackup> &backups) {
-            for (const MemoryBackup &backup : backups) {
-                restoreMemory(backup);
-            }
-            setRegisters(original);
-        };
-
-        regs.rdi = arguments.value(0, 0);
-        regs.rsi = arguments.value(1, 0);
-        regs.rdx = arguments.value(2, 0);
-        regs.rcx = arguments.value(3, 0);
-        regs.r8 = arguments.value(4, 0);
-        regs.r9 = arguments.value(5, 0);
-
-        QVector<MemoryBackup> backups;
-
-        const quint64 codeAddress = (original.rsp - 0x200) & ~static_cast<quint64>(0xFULL);
-        const quint64 returnSlot = codeAddress - sizeof(quint64);
-
-        MemoryBackup stackBackup;
-        stackBackup.address = returnSlot;
-        stackBackup.data = readRemote(returnSlot, sizeof(quint64));
-        if (stackBackup.data.isEmpty()) {
-            restoreState(backups);
-            return false;
-        }
-        backups.append(stackBackup);
-
-        if (ptrace(PTRACE_POKEDATA, m_pid, reinterpret_cast<void *>(returnSlot), nullptr) == -1) {
-            reportErrno(QStringLiteral("ptrace pokedata (return slot) failed"));
-            restoreState(backups);
-            return false;
-        }
-
-        static constexpr qsizetype stubSize = 16;
-        MemoryBackup codeBackup;
-        codeBackup.address = codeAddress;
-        codeBackup.data = readRemote(codeAddress, stubSize);
-        if (codeBackup.data.isEmpty()) {
-            restoreState(backups);
-            return false;
-        }
-        backups.append(codeBackup);
-
-        QByteArray stub(stubSize, char(0x90));
-        stub[0] = char(0x48);
-        stub[1] = char(0xB8);
-        std::memcpy(stub.data() + 2, &functionAddr, sizeof(functionAddr));
-        stub[10] = char(0xFF);
-        stub[11] = char(0xD0);
-        stub[12] = char(0xCC);
-
-        for (qsizetype offset = 0; offset < stubSize; offset += 8) {
-            quint64 word = 0;
-            std::memcpy(&word, stub.constData() + offset, sizeof(word));
-            if (ptrace(PTRACE_POKEDATA,
-                       m_pid,
-                       reinterpret_cast<void *>(codeAddress + static_cast<quint64>(offset)),
-                       reinterpret_cast<void *>(word)) == -1) {
-                reportErrno(QStringLiteral("ptrace pokedata (stub) failed"));
-                restoreState(backups);
-                return false;
-            }
-        }
-
-        regs.rip = codeAddress;
-        regs.rsp = returnSlot;
-
-        if (!setRegisters(regs)) {
-            restoreState(backups);
-            return false;
-        }
-
-        if (ptrace(PTRACE_CONT, m_pid, nullptr, nullptr) == -1) {
-            reportErrno(QStringLiteral("ptrace cont failed"));
-            restoreState(backups);
-            return false;
-        }
-
-        int status = 0;
-        if (waitpid(m_pid, &status, 0) == -1) {
-            reportErrno(QStringLiteral("waitpid during remote call failed"));
-            restoreState(backups);
-            return false;
-        }
-
-        if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-            m_log << "qt-spy cli: unexpected signal while executing remote call." << Qt::endl;
-            restoreState(backups);
-            return false;
-        }
-
-        user_regs_struct after{};
-        if (!getRegisters(after)) {
-            restoreState(backups);
-            return false;
-        }
-
-        if (result) {
-            *result = after.rax;
-        }
-
-        restoreState(backups);
-        return true;
-    }
-
-    quint64 resolveRemoteAddress(void *localSymbol)
-    {
-        Dl_info info{};
-        if (!dladdr(localSymbol, &info) || !info.dli_fname || !info.dli_fbase) {
-            m_log << "qt-spy cli: failed to resolve symbol information for injection." << Qt::endl;
-            return 0;
-        }
-
-        const QString originalPath = QString::fromUtf8(info.dli_fname);
-        const QFileInfo originalInfo(originalPath);
-
-        QStringList searchTerms;
-        QStringList directories;
-        QStringList fileNames;
-
-        auto appendTerm = [&searchTerms](const QString &term) {
-            if (!term.isEmpty() && !searchTerms.contains(term)) {
-                searchTerms << term;
-            }
-        };
-
-        auto appendDirectory = [&directories](const QString &dir) {
-            if (!dir.isEmpty() && !directories.contains(dir)) {
-                directories << dir;
-            }
-        };
-
-        auto appendFileName = [&fileNames](const QString &name) {
-            const QString trimmed = name.trimmed();
-            if (!trimmed.isEmpty() && !fileNames.contains(trimmed)) {
-                fileNames << trimmed;
-            }
-        };
-
-        appendTerm(originalPath);
-        appendTerm(originalInfo.fileName());
-        appendDirectory(originalInfo.absolutePath());
-        appendFileName(originalInfo.fileName());
-
-        const QString canonicalPath = originalInfo.canonicalFilePath();
-        if (!canonicalPath.isEmpty()) {
-            const QFileInfo canonicalInfo(canonicalPath);
-            appendTerm(canonicalPath);
-            appendTerm(canonicalInfo.fileName());
-            appendDirectory(canonicalInfo.absolutePath());
-            appendFileName(canonicalInfo.fileName());
-        }
-
-        if (originalInfo.isSymLink()) {
-            const QString targetPath = originalInfo.symLinkTarget();
-            if (!targetPath.isEmpty()) {
-                const QFileInfo targetInfo(targetPath);
-                appendTerm(targetPath);
-                appendTerm(targetInfo.fileName());
-                appendDirectory(targetInfo.absolutePath());
-                appendFileName(targetInfo.fileName());
-            }
-        }
-
-        const quint64 localBase = reinterpret_cast<quint64>(info.dli_fbase);
-        const quint64 symbolAddress = reinterpret_cast<quint64>(localSymbol);
-        const quint64 offset = symbolAddress - localBase;
-
-        const quint64 remoteBase = findLibraryBase(searchTerms, directories, fileNames);
-        if (remoteBase == 0) {
-            m_log << "qt-spy cli: unable to locate library '" << originalPath
-                  << "' in target process (searched: "
-                  << searchTerms.join(QStringLiteral(", ")) << "; directories: "
-                  << directories.join(QStringLiteral(", ")) << ")." << Qt::endl;
-            return 0;
-        }
-
-        return remoteBase + offset;
-    }
-
-    quint64 findLibraryBase(const QStringList &searchTerms,
-                            const QStringList &directories,
-                            const QStringList &fileNames)
-    {
-        QFile mapsFile(QStringLiteral("/proc/%1/maps").arg(m_pid));
-        if (!mapsFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            m_log << "qt-spy cli: failed to open /proc/" << m_pid << "/maps." << Qt::endl;
-            return 0;
-        }
-
-        auto parseMapping = [](const QString &line, quint64 &baseOut, QString &pathOut) -> bool {
-            const QString trimmed = line.trimmed();
-            const QStringList parts = trimmed.split(' ', Qt::SkipEmptyParts);
-            if (parts.size() < 6) {
-                return false;
-            }
-
-            const QString range = parts.at(0);
-            const int dashIndex = range.indexOf('-');
-            if (dashIndex <= 0) {
-                return false;
-            }
-
-            bool ok = false;
-            baseOut = range.left(dashIndex).toULongLong(&ok, 16);
-            if (!ok) {
-                return false;
-            }
-
-            const QString perms = parts.at(1);
-            if (!perms.startsWith(QStringLiteral("r-x"))) {
-                return false;
-            }
-
-            const int pathIndex = trimmed.indexOf('/');
-            if (pathIndex < 0) {
-                return false;
-            }
-
-            pathOut = trimmed.mid(pathIndex);
-            return true;
-        };
-
-        QSet<QString> seenTerms;
-        QStringList normalizedTerms;
-        auto addTerm = [&normalizedTerms, &seenTerms](const QString &term) {
-            const QString trimmed = term.trimmed();
-            if (!trimmed.isEmpty() && !seenTerms.contains(trimmed)) {
-                normalizedTerms << trimmed;
-                seenTerms.insert(trimmed);
-            }
-        };
-
-        for (const QString &term : searchTerms) {
-            addTerm(term);
-            addTerm(QFileInfo(term).fileName());
-        }
-
-        QSet<QString> normalizedDirSet;
-        QStringList normalizedDirs;
-        auto addDirectory = [&normalizedDirSet, &normalizedDirs](const QString &dir) {
-            const QString trimmed = dir.trimmed();
-            if (!trimmed.isEmpty() && !normalizedDirSet.contains(trimmed)) {
-                normalizedDirSet.insert(trimmed);
-                normalizedDirs << trimmed;
-            }
-        };
-
-        for (const QString &dir : directories) {
-            addDirectory(dir);
-        }
-
-        QSet<QString> normalizedFileNames;
-        for (const QString &name : fileNames) {
-            const QString trimmed = name.trimmed();
-            if (!trimmed.isEmpty()) {
-                normalizedFileNames.insert(trimmed);
-            }
-        }
-
-        struct MappingCandidate {
-            quint64 base = 0;
-            QString path;
-            QString fileName;
-        };
-
-        QVector<MappingCandidate> deferredNameMatches;
-        QVector<MappingCandidate> libcCandidates;
-
-        while (!mapsFile.atEnd()) {
-            const QString line = QString::fromLocal8Bit(mapsFile.readLine());
-            quint64 base = 0;
-            QString path;
-            if (!parseMapping(line, base, path)) {
-                continue;
-            }
-
-            const QFileInfo mappingInfo(path);
-            const QString fileName = mappingInfo.fileName();
-            addDirectory(mappingInfo.absolutePath());
-            if (path.contains(QStringLiteral("libc"))) {
-                m_log << "qt-spy cli: observed mapping candidate path='" << path
-                      << "' (file='" << fileName << "')";
-                if (normalizedTerms.contains(fileName)) {
-                    m_log << " [filename match]";
-                }
-                if (!normalizedDirs.isEmpty()) {
-                    auto it = std::find_if(normalizedDirs.begin(), normalizedDirs.end(),
-                                           [&path](const QString &dir) { return path.startsWith(dir); });
-                    if (it != normalizedDirs.end()) {
-                        m_log << " [directory match='" << *it << "']";
-                    }
-                }
-                m_log << Qt::endl;
-            }
-            bool matched = false;
-            for (const QString &needle : normalizedTerms) {
-                if (needle.isEmpty()) {
-                    continue;
-                }
-                if (path == needle || path.endsWith(needle) || fileName == needle) {
-                    matched = true;
-                    break;
-                }
-            }
-
-            if (!matched && !normalizedDirs.isEmpty()) {
-                for (const QString &dir : normalizedDirs) {
-                    if (path.startsWith(dir)) {
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-
-            if (matched) {
-                m_log << "qt-spy cli: resolved '" << fileName << "' at " << QString::number(base, 16)
-                      << " via mapping (path=" << path << ")." << Qt::endl;
-                return base;
-            }
-
-            if (normalizedFileNames.contains(fileName)) {
-                deferredNameMatches.append(MappingCandidate{base, path, fileName});
-            }
-
-            if (path.contains(QStringLiteral("libc"))) {
-                libcCandidates.append(MappingCandidate{base, path, fileName});
-            }
-        }
-
-        mapsFile.seek(0);
-        while (!mapsFile.atEnd()) {
-            const QString line = QString::fromLocal8Bit(mapsFile.readLine());
-            quint64 base = 0;
-            QString path;
-            if (!parseMapping(line, base, path)) {
-                continue;
-            }
-
-            const QString fileName = QFileInfo(path).fileName();
-            if (fileName.startsWith(QStringLiteral("libc"), Qt::CaseInsensitive) &&
-                fileName.contains(QStringLiteral(".so"))) {
-                m_log << "qt-spy cli: resolved '" << fileName << "' at " << QString::number(base, 16)
-                      << " via generic libc fallback (path=" << path << ")." << Qt::endl;
-                return base;
-            }
-            if (path.contains(QStringLiteral("libc")) && path.contains(QStringLiteral(".so"))) {
-                m_log << "qt-spy cli: resolved mapping by substring match at "
-                      << QString::number(base, 16) << " (path=" << path << ")." << Qt::endl;
-                return base;
-            }
-        }
-
-        if (!deferredNameMatches.isEmpty()) {
-            const auto &candidate = deferredNameMatches.first();
-            m_log << "qt-spy cli: resolved '" << candidate.fileName << "' at "
-                  << QString::number(candidate.base, 16)
-                  << " via filename fallback (path=" << candidate.path << ")." << Qt::endl;
-            return candidate.base;
-        }
-
-        if (!libcCandidates.isEmpty()) {
-            QStringList candidatePaths;
-            candidatePaths.reserve(libcCandidates.size());
-            for (const auto &candidate : std::as_const(libcCandidates)) {
-                candidatePaths << candidate.path;
-            }
-            m_log << "qt-spy cli: libc candidates encountered but unsuitable: "
-                  << candidatePaths.join(QStringLiteral(", ")) << Qt::endl;
-        }
-
-        return 0;
-    }
-
-    void reportErrno(const QString &context)
-    {
-        const QString message = QString::fromLocal8Bit(std::strerror(errno));
-        m_log << "qt-spy cli: " << context;
-        if (!message.isEmpty()) {
-            m_log << ": " << message;
-        }
-        m_log << Qt::endl;
-    }
-
-    pid_t m_pid;
-    QTextStream &m_log;
-    bool m_attached = false;
-};
-
-#endif // defined(Q_OS_UNIX) && defined(__x86_64__)
-
 struct ActionTarget {
     enum class Kind { None, Id, FirstRoot };
 
@@ -1160,7 +541,6 @@ private:
     QString currentServerName() const;
     bool advanceServerNameForRetry(bool dropCurrent = false);
     bool attemptInjection();
-    QString bootstrapLibraryPath() const;
     QString nextRequestId();
     void resolveDeferredTargets(const QJsonArray &rootIds);
     void completeTarget(ActionTarget &target);
@@ -1566,32 +946,46 @@ bool Client::attemptInjection()
         return false;
     }
 
-    const QString libraryPath = bootstrapLibraryPath();
-    if (libraryPath.isEmpty()) {
-        m_stderr << "qt-spy cli: bootstrap library path is not available." << Qt::endl;
+    // Use the proven shell script injection method (same as GUI inspector)
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QString projectRoot = QDir(appDir).absoluteFilePath("../..");
+    const QString injectionScript = projectRoot + "/scripts/inject_qt_spy.sh";
+    
+    if (!QFile::exists(injectionScript)) {
+        m_stderr << "qt-spy cli: injection script not found at " << injectionScript << Qt::endl;
         return false;
     }
 
-    const QFileInfo libraryInfo(libraryPath);
-    if (!libraryInfo.exists()) {
-        m_stderr << "qt-spy cli: bootstrap library not found at '" << libraryPath << "'." << Qt::endl;
+    QProcess injectionProcess;
+    injectionProcess.setProgram(injectionScript);
+    injectionProcess.setArguments({QString::number(m_options.targetPid)});
+    injectionProcess.setWorkingDirectory(projectRoot);
+    
+    injectionProcess.start();
+    
+    if (!injectionProcess.waitForFinished(30000)) { // 30 second timeout
+        m_stderr << "qt-spy cli: probe injection timed out for PID " << m_options.targetPid << Qt::endl;
+        injectionProcess.kill();
+        injectionProcess.waitForFinished(2000);
         return false;
     }
-
-#if defined(__x86_64__)
-    PtraceInjector injector(static_cast<pid_t>(m_options.targetPid), m_stderr);
-    if (!injector.inject(libraryInfo.absoluteFilePath())) {
+    
+    const int exitCode = injectionProcess.exitCode();
+    
+    if (exitCode == 0) {
+        m_injectionSucceeded = true;
+        m_retryAttempt = 0;
+        m_stderr << "qt-spy cli: injected probe into pid=" << m_options.targetPid << Qt::endl;
+        return true;
+    } else {
+        const QByteArray stderrOutput = injectionProcess.readAllStandardError();
+        if (!stderrOutput.isEmpty()) {
+            m_stderr << "qt-spy cli: injection error: " << QString::fromLocal8Bit(stderrOutput).trimmed() << Qt::endl;
+        }
+        m_stderr << "qt-spy cli: probe injection failed for PID " << m_options.targetPid 
+                 << " (exit code: " << exitCode << ")" << Qt::endl;
         return false;
     }
-
-    m_injectionSucceeded = true;
-    m_retryAttempt = 0;
-    m_stderr << "qt-spy cli: injected probe into pid=" << m_options.targetPid << Qt::endl;
-    return true;
-#else
-    m_stderr << "qt-spy cli: ptrace-based injection currently supports only x86_64 targets." << Qt::endl;
-    return false;
-#endif
 #else
     Q_UNUSED(m_options);
     m_injectionAttempted = true;
@@ -1600,14 +994,7 @@ bool Client::attemptInjection()
 #endif
 }
 
-QString Client::bootstrapLibraryPath() const
-{
-#ifdef QT_SPY_BOOTSTRAP_LIBRARY_PATH
-    return QString::fromUtf8(QT_SPY_BOOTSTRAP_LIBRARY_PATH);
-#else
-    return {};
-#endif
-}
+
 
 QString Client::nextRequestId()
 {

@@ -99,15 +99,47 @@ fi
 echo "Injecting qt-spy into process $PID..."
 echo "Bootstrap library: $BOOTSTRAP_LIB"
 
+TARGET_ROOT="/proc/$PID/root"
+TARGET_TMP_DIR="$TARGET_ROOT/tmp/qt_spy"
+INJECTION_PATH="$BOOTSTRAP_LIB"
+STAGED_HOST_PATH=""
+
+if [ -d "$TARGET_ROOT" ]; then
+    if mkdir -p "$TARGET_TMP_DIR" 2>/dev/null; then
+        STAGED_BASENAME="libqt_spy_probe_bootstrap_${PID}_$(date +%s)_$$.so"
+        STAGED_HOST_PATH="$TARGET_TMP_DIR/$STAGED_BASENAME"
+        if cp "$BOOTSTRAP_LIB" "$STAGED_HOST_PATH" 2>/dev/null; then
+            chmod 755 "$STAGED_HOST_PATH" 2>/dev/null || true
+            INJECTION_PATH="/tmp/qt_spy/$STAGED_BASENAME"
+            echo "Staged bootstrap inside target root at $INJECTION_PATH"
+        else
+            echo "Warning: failed to stage bootstrap inside target root, using host path." >&2
+            STAGED_HOST_PATH=""
+        fi
+    else
+        echo "Warning: unable to create staging directory inside target root, using host path." >&2
+    fi
+else
+    echo "Warning: target root $TARGET_ROOT not accessible; using host path for injection." >&2
+fi
+
 # Create GDB script
 GDB_SCRIPT=$(mktemp)
-trap "rm -f $GDB_SCRIPT" EXIT
+
+cleanup() {
+    rm -f "$GDB_SCRIPT"
+    if [ -n "$STAGED_HOST_PATH" ]; then
+        rm -f "$STAGED_HOST_PATH" 2>/dev/null || true
+        rmdir "$TARGET_TMP_DIR" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 cat > "$GDB_SCRIPT" << EOF
 set confirm off
 set pagination off
 attach $PID
-call (void*)dlopen("$BOOTSTRAP_LIB", 2)
+call (void*)dlopen("$INJECTION_PATH", 2)
 detach
 quit
 EOF
