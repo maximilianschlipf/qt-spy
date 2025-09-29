@@ -13,11 +13,20 @@ NodeData NodeData::fromJson(const QJsonObject &json) {
     node.id = json.value(QLatin1String(protocol::keys::kId)).toString();
     node.parentId = json.value(QLatin1String(protocol::keys::kParentId)).toString();
     
-    // Extract className and objectName from properties or node object
+    // Extract className and objectName - try multiple sources
+    // 1. First try directly from the json object (snapshot format)
+    node.className = json.value("className").toString();
+    node.objectName = json.value("objectName").toString();
+    
+    // 2. Try from nested node object (some message formats)
     const QJsonObject nodeObj = json.value(QLatin1String(protocol::keys::kNode)).toObject();
     if (!nodeObj.isEmpty()) {
-        node.className = nodeObj.value("className").toString();
-        node.objectName = nodeObj.value("objectName").toString();
+        if (node.className.isEmpty()) {
+            node.className = nodeObj.value("className").toString();
+        }
+        if (node.objectName.isEmpty()) {
+            node.objectName = nodeObj.value("objectName").toString();
+        }
     }
     
     // Store full properties
@@ -26,7 +35,7 @@ NodeData NodeData::fromJson(const QJsonObject &json) {
         node.properties = nodeObj;
     }
     
-    // Extract className and objectName from properties if not already set
+    // 3. Extract className and objectName from properties if still not set
     if (node.className.isEmpty()) {
         node.className = node.properties.value("className").toString();
     }

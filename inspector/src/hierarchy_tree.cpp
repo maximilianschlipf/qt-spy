@@ -97,11 +97,32 @@ void HierarchyTreeModel::loadSnapshot(const QJsonObject &snapshot) {
         NodeData nodeData = NodeData::fromJson(nodeJson);
         nodeData.id = rootId;
         
-        // Skip nodes with empty display names (internal Qt objects)
+        // For root nodes, be very restrictive - only show actual UI containers
         const QString displayName = nodeData.displayName();
-        if (displayName.isEmpty() || displayName.trimmed().isEmpty()) {
-            qDebug() << "HierarchyTreeModel: Skipping root item with empty display name:" << rootId;
+        const QString className = nodeData.className;
+        
+        // Only allow top-level UI container classes as roots
+        bool isUIContainer = (className == "QQuickView" || 
+                             className == "QMainWindow" || 
+                             className == "QWidget" || 
+                             className == "QWindow" ||
+                             className == "QDialog" ||
+                             (className.endsWith("Widget") && className.startsWith("Q")) ||
+                             (className.endsWith("Window") && className.startsWith("Q")) ||
+                             (className.endsWith("View") && className.startsWith("Q")));
+        
+        if (!isUIContainer) {
+            qDebug() << "HierarchyTreeModel: Skipping non-UI container root item:" << rootId << "className:" << className << "displayName:" << displayName;
             continue;
+        }
+        
+        qDebug() << "HierarchyTreeModel: Including UI container root item:" << className << "for root ID:" << rootId;
+        
+        // Use className as display name if no better option
+        if (displayName.isEmpty() || displayName.trimmed().isEmpty()) {
+            if (nodeData.objectName.isEmpty()) {
+                nodeData.objectName = className;
+            }
         }
         
         qDebug() << "HierarchyTreeModel: Creating root item for:" << displayName;
@@ -371,10 +392,27 @@ void HierarchyTreeModel::fetchMore(const QModelIndex &parent) {
         NodeData childData = NodeData::fromJson(childNodeData);
         childData.id = childId;
         
-        // Skip children with empty display names
-        if (childData.displayName().trimmed().isEmpty()) {
-            qDebug() << "HierarchyTreeModel: Skipping child with empty display name:" << childId;
-            continue;
+        // Skip children with empty display names, but include UI-related children
+        const QString displayName = childData.displayName();
+        if (displayName.isEmpty() || displayName.trimmed().isEmpty()) {
+            // For child nodes, accept UI-related classes and QML items
+            const QString className = childData.className;
+            if (className.startsWith("QQuick") ||  // QML items (QQuickItem, QQuickRectangle, etc.)
+                className.startsWith("QWidget") ||
+                className.startsWith("QWindow") ||
+                className.startsWith("QDialog") ||
+                className.endsWith("Widget") ||
+                className.endsWith("Item") ||
+                className.endsWith("_QMLTYPE_")) {  // QML types
+                qDebug() << "HierarchyTreeModel: Including UI child with className:" << className << "for child ID:" << childId;
+                // Use className as display name if no better option
+                if (childData.objectName.isEmpty()) {
+                    childData.objectName = className;
+                }
+            } else {
+                qDebug() << "HierarchyTreeModel: Skipping non-UI child with empty display name:" << childId << "className:" << className;
+                continue;
+            }
         }
         
         childrenData.append(childData);
